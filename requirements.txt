@@ -3,5 +3,9 @@ keras
 opencv-python
 numpy
 matplotlib
-tensorflow_addons
+pandas
 scipy
+scikit-learn
+scikit-image
+imageio
+pydot
