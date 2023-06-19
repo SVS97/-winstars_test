@@ -1,54 +1,97 @@
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-from utils import create_data, area_isnull, calc_area_for_rle, calc_class
-from config import TRAIN_DIR, checkpoint_filepath, CSV_ANNOTATION, CORRUPTED_IMAGES, IMG_SIZE
+
+from utils import rle_to_mask, one_hot
+from config import TRAIN_DIR, checkpoint_filepath, CSV_ANNOTATION, CORRUPTED_IMAGES, RANDOM_SEED, \
+    IMAGES_WITHOUT_SHIPS_NUMBER, \
+    VALIDATION_LENGTH, TEST_LENGTH, BATCH_SIZE, IMG_SHAPE, NUM_CLASSES
 from model import Unet_model
-from imageio import imread
 import pandas as pd
+import random
+import numpy as np
+import tensorflow as tf
+import cv2
 
 
-model = Unet_model()
-model.load_weights(checkpoint_filepath)
-opt_threshold = 0.2
-
-# prepare images for inference
-train_df = pd.read_csv(CSV_ANNOTATION)
-# remove bug image
-train_df = train_df[train_df['ImageId'] != CORRUPTED_IMAGES]
-
-# remove 100000 non-ship images
-train_df['isnan'] = train_df['EncodedPixels'].apply(area_isnull)
-train_df['isnan'].value_counts()
-train_df = train_df.sort_values('isnan', ascending=False)
-train_df = train_df.iloc[100000:]
-train_df['isnan'].value_counts()
-
-# calculate ship area and group by ImageId
-train_df['area'] = train_df['EncodedPixels'].apply(calc_area_for_rle)
-# get small area of one ship; If estimated area of the ship is less than 10, it is corrected to 0.
-train_df_isship = train_df[train_df['area'] > 0]
-train_df_smallarea = train_df_isship['area'][train_df_isship['area'] < 10]
-train_gp = train_df.groupby('ImageId').sum()
-train_gp = train_gp.reset_index()
-
-# set class of ship area
-train_gp['class'] = train_gp['area'].apply(calc_class)
-train, val = train_test_split(train_gp, test_size=0.01, stratify=train_gp['class'].tolist())
-val_list = val['ImageId'].tolist()
+def predict(image):
+    image = np.expand_dims(image, axis=0)
+    pred_mask = model.predict(image)[0].argmax(axis=-1)
+    return pred_mask
 
 
-image_list = val_list[28:38]
-fig, axes = plt.subplots(len(image_list), 3, figsize=(5,5*len(image_list)))
-for i in range(len(image_list)):
-    img = imread(TRAIN_DIR + image_list[i])
-    input_img, gt_mask = create_data(train_df, [image_list[i]])
-    pred_mask = model.predict(input_img)
-    pred_mask = pred_mask > opt_threshold
-    pred_mask = pred_mask.reshape(IMG_SIZE, IMG_SIZE, 1)
-    gt_mask = gt_mask * 255
-    gt_mask = gt_mask.reshape(IMG_SIZE, IMG_SIZE)
-    pred_mask = pred_mask.reshape(IMG_SIZE, IMG_SIZE)
-    axes[i, 0].imshow(img)
-    axes[i, 1].imshow(gt_mask)
-    axes[i, 2].imshow(pred_mask)
-plt.show()
+def load_train_image(tensor) -> tuple:
+    path = tf.get_static_value(tensor).decode("utf-8")
+
+    image_id = path.split('/')[-1]
+    input_image = cv2.imread(path)
+    input_image = tf.image.resize(input_image, IMG_SHAPE)
+    input_image = tf.cast(input_image, tf.float32) / 255.0
+
+    encoded_mask = image_segmentation[image_segmentation['ImageId'] == image_id].iloc[0]['EncodedPixels']
+    input_mask = np.zeros(IMG_SHAPE + (1,), dtype=np.int8)
+    if not pd.isna(encoded_mask):
+        input_mask = rle_to_mask(encoded_mask)
+        input_mask = cv2.resize(input_mask, IMG_SHAPE, interpolation=cv2.INTER_AREA)
+        input_mask = np.expand_dims(input_mask, axis=2)
+    one_hot_segmentation_mask = one_hot(input_mask, NUM_CLASSES)
+    input_mask_tensor = tf.convert_to_tensor(one_hot_segmentation_mask, dtype=tf.float32)
+
+    class_weights = tf.constant([0.0005, 0.9995], tf.float32)
+    sample_weights = tf.gather(class_weights, indices=tf.cast(input_mask_tensor, tf.int32), name='cast_sample_weights')
+
+    return input_image, input_mask_tensor, sample_weights
+
+
+if __name__ == '__main__':
+    # set number of images
+    N = 5
+    model = Unet_model()
+    model.load_weights(checkpoint_filepath)
+
+    # set the random seed:
+    random.seed(RANDOM_SEED)
+
+    df = pd.read_csv(CSV_ANNOTATION)
+    df['EncodedPixels'] = df['EncodedPixels'].astype('string')
+
+    # Delete corrupted images
+    CORRUPTED_IMAGES = ['6384c3e78.jpg']
+    df = df.drop(df[df['ImageId'].isin(CORRUPTED_IMAGES)].index)
+
+    # Dataframe that contains the segmentation for each ship in the image.
+    instance_segmentation = df
+
+    # Dataframe that contains the segmentation of all ships in the image.
+    image_segmentation = df.groupby(by=['ImageId'])['EncodedPixels'].apply(
+        lambda x: np.nan if pd.isna(x).any() else ' '.join(x)).reset_index()
+
+    # reduce the number of images without ships
+    images_without_ships = image_segmentation[image_segmentation['EncodedPixels'].isna()]['ImageId'].values[
+                           :IMAGES_WITHOUT_SHIPS_NUMBER]
+    images_with_ships = image_segmentation[image_segmentation['EncodedPixels'].notna()]['ImageId'].values
+    images_list = np.append(images_without_ships, images_with_ships)
+
+    # remove corrupted images
+    images_list = np.array(list(filter(lambda x: x not in CORRUPTED_IMAGES, images_list)))
+
+    images_list = tf.data.Dataset.list_files([f'{TRAIN_DIR}{name}' for name in images_list], shuffle=True)
+    train_images = images_list.map(lambda x: tf.py_function(load_train_image, [x], [tf.float32, tf.float32]),
+                                   num_parallel_calls=tf.data.AUTOTUNE)
+
+    validation_dataset = train_images.take(VALIDATION_LENGTH)
+    test_dataset = train_images.skip(VALIDATION_LENGTH).take(TEST_LENGTH)
+
+    f, ax = plt.subplots(N, 3, figsize=(10, 4 * N))
+    i = 0
+    for image, mask in test_dataset.take(N):
+        mask = mask.numpy().argmax(axis=-1)
+        ax[i, 0].imshow(image)
+        ax[i, 0].set_title('image')
+        ax[i, 1].imshow(mask)
+        ax[i, 1].set_title('true mask')
+
+        pred_mask = predict(image)
+        ax[i, 2].imshow(pred_mask)
+        ax[i, 2].set_title('predicted mask')
+        i += 1
+
+    plt.show()
