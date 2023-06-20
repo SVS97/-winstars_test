@@ -20,6 +20,9 @@ Checkpoint for inference download [here](https://drive.google.com/drive/folders/
 ### Model architecture
 ![Model architecture](https://github.com/SVS97/-winstars_test/blob/main/model.png?raw=true)
 
+### Model loss
+![Model loss](https://github.com/SVS97/-winstars_test/blob/main/losses.png?raw=true)
+
 ### Dice score is 0.581 
 ![Dice score](https://github.com/SVS97/-winstars_test/blob/main/score.png?raw=true)
 
